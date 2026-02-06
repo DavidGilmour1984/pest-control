@@ -1,0 +1,369 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <Preferences.h>
+#include <time.h>
+
+// =======================
+// WIFI
+// =======================
+const char* ssid     = "G2.4";
+const char* password = "DhH2TuTYRVtQgYLF";
+
+// =======================
+// STATIC IP CONFIG
+// =======================
+IPAddress local_IP(192, 168, 1, 50);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns(192, 168, 1, 1);
+
+// =======================
+// NZ TIMEZONE (DST AWARE)
+// =======================
+const char* TZ_NZ =
+  "NZST-12NZDT,M9.5.0/02:00:00,M4.1.0/03:00:00";
+
+// =======================
+// OBJECTS
+// =======================
+WebServer server(80);
+MPU6050 mpu;
+Preferences prefs;
+
+// =======================
+// SETTINGS (PERSISTENT)
+// =======================
+float accelThreshold = 1.5;
+unsigned long cooldownSec = 2;
+
+// =======================
+// STATE
+// =======================
+float baselineAccel = 1.0;
+unsigned long lastTriggerMs = 0;
+unsigned long lastZeroMs = 0;
+unsigned long zeroIntervalMs = 20000;
+
+bool eventActive = false;
+float currentPeak = 0.0;
+
+int eventCount = 0;
+// "timestamp|peak,"
+String eventLog = "";
+
+// =======================
+// HTML PAGE
+// =======================
+String page() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:Helvetica;background:#f5f7fb;padding:20px}
+.card{background:#fff;padding:20px;border-radius:14px;
+box-shadow:0 6px 18px rgba(0,0,0,0.1);
+max-width:1100px;margin:auto}
+h2{text-align:center}
+.controls{
+  display:grid;
+  grid-template-columns: 1fr 220px;
+  gap:20px;
+  align-items:start;
+}
+.left label{display:block;margin-top:10px}
+.left input{font-size:18px;padding:8px;width:160px}
+.right{
+  display:grid;
+  grid-template-rows: repeat(3,auto);
+  gap:12px;
+}
+button{
+  font-size:18px;
+  padding:12px;
+  border:none;
+  border-radius:10px;
+  color:#fff;
+  background:#2563eb;
+  cursor:pointer;
+}
+button.red{background:#dc2626}
+button.grey{background:#6b7280}
+table{width:100%;border-collapse:collapse;margin-top:14px}
+th,td{border:1px solid #ddd;padding:6px;text-align:center}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>Acceleration Trap Monitor</h2>
+
+<b>Live Net Acceleration:</b>
+<div id="live">---</div>
+
+<hr>
+
+<div class="controls">
+  <div class="left">
+    <label>Threshold (g)</label>
+    <input id="thr" type="number" step="0.01">
+    <label>Cooldown (seconds)</label>
+    <input id="cd" type="number">
+  </div>
+
+  <div class="right">
+    <button onclick="apply()">Apply settings</button>
+    <button class="grey" onclick="checkAll()">Check all</button>
+    <button class="red" onclick="clearSelected()">Clear selected</button>
+  </div>
+</div>
+
+<hr>
+
+<b>Event Count:</b>
+<div id="count">0</div>
+
+<table>
+<thead>
+<tr>
+  <th>Select</th>
+  <th>#</th>
+  <th>Time (NZ)</th>
+  <th>Peak (g)</th>
+</tr>
+</thead>
+<tbody id="events"></tbody>
+</table>
+</div>
+
+<script>
+let editing = false;
+let applying = false;
+let selected = new Set();
+
+['thr','cd'].forEach(id=>{
+  const el=document.getElementById(id);
+  el.addEventListener('focus',()=>editing=true);
+  el.addEventListener('blur',()=>editing=false);
+});
+
+function refresh(){
+  if(applying) return;
+
+  fetch('/data').then(r=>r.json()).then(d=>{
+    document.getElementById('live').innerHTML =
+      d.accel.toFixed(3)+" g";
+    document.getElementById('count').innerHTML = d.count;
+
+    if(!editing){
+      thr.value = d.threshold;
+      cd.value  = d.cooldown;
+    }
+
+    let rows='';
+    d.events.forEach((e,i)=>{
+      const checked = selected.has(i) ? 'checked' : '';
+      rows+=`<tr>
+        <td><input type="checkbox" ${checked}
+          onchange="toggle(${i},this.checked)"></td>
+        <td>${i+1}</td>
+        <td>${e.time}</td>
+        <td>${e.peak.toFixed(3)}</td>
+      </tr>`;
+    });
+    document.getElementById('events').innerHTML = rows;
+  });
+}
+
+function toggle(i,val){
+  if(val) selected.add(i);
+  else selected.delete(i);
+}
+
+function apply(){
+  applying = true;
+  fetch(`/set?thr=${thr.value}&cd=${cd.value}`)
+    .then(()=>setTimeout(()=>applying=false,300));
+}
+
+function checkAll(){
+  document.querySelectorAll('#events input[type=checkbox]')
+    .forEach((c,i)=>{
+      c.checked=true;
+      selected.add(i);
+    });
+}
+
+function clearSelected(){
+  if(selected.size===0) return;
+  if(!confirm("Clear selected events?")) return;
+  fetch('/clearSelected?idx='+[...selected].join(','))
+    .then(()=>selected.clear());
+}
+
+setInterval(refresh,200);
+</script>
+</body>
+</html>
+)rawliteral";
+}
+
+// =======================
+// ACCEL HELPERS
+// =======================
+float rawAccelMag() {
+  int16_t ax, ay, az;
+  mpu.getAcceleration(&ax,&ay,&az);
+  float x=ax/16384.0;
+  float y=ay/16384.0;
+  float z=az/16384.0;
+  return sqrt(x*x + y*y + z*z);
+}
+
+void zeroAccel() {
+  baselineAccel = rawAccelMag();
+  lastZeroMs = millis();
+}
+
+float netAccel() {
+  return fabs(rawAccelMag() - baselineAccel);
+}
+
+// =======================
+// SETUP
+// =======================
+void setup() {
+  Wire.begin(21,22);
+
+  prefs.begin("trap", false);
+  accelThreshold = prefs.getFloat("thr", 1.5);
+  cooldownSec = prefs.getULong("cd", 2);
+  eventLog = prefs.getString("log", "");
+  eventCount = prefs.getInt("cnt", 0);
+
+  mpu.initialize();
+  zeroAccel();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.config(local_IP, gateway, subnet, dns);
+  WiFi.begin(ssid, password);
+  while(WiFi.status()!=WL_CONNECTED) delay(200);
+
+  configTime(0,0,"pool.ntp.org","time.nist.gov");
+  setenv("TZ", TZ_NZ, 1);
+  tzset();
+
+  server.on("/", [](){ server.send(200,"text/html",page()); });
+
+  server.on("/data", [](){
+    String json="{";
+    json+="\"accel\":"+String(netAccel(),3)+",";
+    json+="\"threshold\":"+String(accelThreshold)+",";
+    json+="\"cooldown\":"+String(cooldownSec)+",";
+    json+="\"count\":"+String(eventCount)+",";
+    json+="\"events\":[";
+
+    int s=0;
+    for(int i=0;i<eventCount;i++){
+      int sep=eventLog.indexOf('|',s);
+      int end=eventLog.indexOf(',',s);
+      if(sep<0||end<0) break;
+      if(i>0) json+=",";
+      json+="{\"time\":";
+      json+=eventLog.substring(s,sep);
+      json+=",\"peak\":";
+      json+=eventLog.substring(sep+1,end);
+      json+="}";
+      s=end+1;
+    }
+    json+="]}";
+    server.send(200,"application/json",json);
+  });
+
+  server.on("/set", [](){
+    accelThreshold = server.arg("thr").toFloat();
+    cooldownSec = server.arg("cd").toInt();
+    prefs.putFloat("thr", accelThreshold);
+    prefs.putULong("cd", cooldownSec);
+    server.send(200,"text/plain","OK");
+  });
+
+  server.on("/clearSelected", [](){
+    String idx = server.arg("idx");
+    bool remove[eventCount];
+    memset(remove,false,sizeof(remove));
+
+    int p=0;
+    while(true){
+      int c = idx.indexOf(',',p);
+      int i = (c<0)? idx.substring(p).toInt()
+                   : idx.substring(p,c).toInt();
+      if(i>=0 && i<eventCount) remove[i]=true;
+      if(c<0) break;
+      p=c+1;
+    }
+
+    String newLog="";
+    int s=0,newCount=0;
+    for(int i=0;i<eventCount;i++){
+      int end=eventLog.indexOf(',',s);
+      if(end<0) break;
+      if(!remove[i]){
+        newLog+=eventLog.substring(s,end+1);
+        newCount++;
+      }
+      s=end+1;
+    }
+
+    eventLog=newLog;
+    eventCount=newCount;
+    prefs.putString("log",eventLog);
+    prefs.putInt("cnt",eventCount);
+    server.send(200,"text/plain","CLEARED");
+  });
+
+  server.begin();
+}
+
+// =======================
+// LOOP
+// =======================
+void loop() {
+  server.handleClient();
+
+  if(millis()-lastZeroMs > zeroIntervalMs){
+    zeroAccel();
+  }
+
+  float a = netAccel();
+
+  if(a > accelThreshold){
+    if(!eventActive){
+      eventActive=true;
+      currentPeak=a;
+    } else if(a > currentPeak){
+      currentPeak=a;
+    }
+  }
+
+  if(eventActive &&
+     millis()-lastTriggerMs > cooldownSec*1000){
+
+    lastTriggerMs=millis();
+    eventActive=false;
+    eventCount++;
+
+    time_t now=time(nullptr);
+    struct tm t;
+    localtime_r(&now,&t);
+    char ts[32];
+    strftime(ts,sizeof(ts),
+      "\"%Y-%m-%d %H:%M:%S\"", &t);
+
+    eventLog+=String(ts)+"|"+String(currentPeak,3)+",";
+    prefs.putString("log",eventLog);
+    prefs.putInt("cnt",eventCount);
+  }
+}
