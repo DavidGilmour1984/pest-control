@@ -9,7 +9,7 @@
 // WIFI
 // =======================
 const char* ssid     = "G2.4";
-const char* password = "DhH2TuTYRVtQgYLF";
+const char* password = "";
 
 // =======================
 // STATIC IP CONFIG
